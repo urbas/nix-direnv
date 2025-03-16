@@ -218,6 +218,17 @@ _nix_clean_old_gcroots() {
   rm -f "$layout_dir"/{nix,flake}-profile*
 }
 
+# Rebuild symlinks in a directory by creating nix store references
+# Returns 0 on success, 1 if any symlink couldn't be rebuilt
+_rebuild_nix_store_symlinks() {
+  local dir=$1
+  while IFS= read -r -d '' link; do
+    if ! nix build --out-link "$link" "$(realpath "$link")"; then
+      return 1
+    fi
+  done < <(find "$dir" -type l -print0)
+}
+
 _update_flake_profile() {
   local layout_dir=$1
   local profile=$2
@@ -258,6 +269,76 @@ _update_flake_profile() {
     # Fallback to use that (which means just leaving profile_rc alone!)
     _nix_direnv_warning "Evaluating current devShell failed. Falling back to previous environment!"
     export NIX_DIRENV_DID_FALLBACK=1
+  fi
+}
+
+_calculate_cache_hash() {
+  local -n _hash_input_files=$1
+  local flake_uri=${2:-}
+  local hash=$(cat <(echo "nix-direnv-cache-v1") <(echo "$flake_uri") "${_hash_input_files[@]}" 2>/dev/null | sha256sum | cut -f1 -d" ")
+  if [[ -z hash ]]; then
+    _nix_direnv_error "Failed to calculate the cache lookup hash."
+    return 1
+  fi
+  echo -n "$hash"
+}
+
+_restore_from_cache() {
+  local hash=$1
+  local layout_dir=$2
+
+  if ! command -v detcache &> /dev/null; then
+    _nix_direnv_info "Persistent caching is not available. Install the 'detcache' command to enable it."
+    return 1
+  fi
+
+  local tmp_dir
+  tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/direnv-detcache.XXXXXX")
+  if [[ ! -d "$tmp_dir" ]]; then
+    _nix_direnv_error "Failed to create temporary directory"
+    return 1
+  fi
+
+  if detcache -v get "$hash" | tar -xC "$tmp_dir" 2>/dev/null; then
+    # Check if layout_dir already contains the same content as tmp_dir
+    if [[ -d "$layout_dir" ]] && diff -r --no-dereference "$layout_dir" "$tmp_dir" &>/dev/null; then
+      _nix_direnv_info "Reusing existing environment as it matches the cache"
+      rm -rf "$tmp_dir"
+      return 0
+    fi
+
+    # Check if the extracted content has broken symlinks
+    if ! _rebuild_nix_store_symlinks "$tmp_dir"; then
+      _nix_direnv_warning "Cache contains broken symlinks, rebuilding environment"
+      rm -rf "$tmp_dir"
+      return 1
+    fi
+
+    rm -rf "$layout_dir"
+    if mv "$tmp_dir" "$layout_dir" 2>/dev/null; then
+      # After the move the GC roots will become invalid, so we have to create valid GC roots again.
+      _rebuild_nix_store_symlinks "$layout_dir"
+      _nix_direnv_info "Restored environment from cache"
+      return 0
+    fi
+  fi
+
+  rm -rf "$tmp_dir"
+  return 1
+}
+
+_store_into_cache() {
+  local hash=$1
+  local layout_dir=$2
+
+  if ! command -v detcache &> /dev/null; then
+    return 0
+  fi
+
+  if [[ -d "$layout_dir" ]]; then
+    if tar --owner=0 --group=0 -C "$layout_dir" -c . | detcache -v put "$hash"; then
+      _nix_direnv_info "Cached the environment."
+    fi
   fi
 }
 
@@ -354,6 +435,7 @@ use_flake() {
   local need_update=0
   local watches
   _nix_direnv_watches watches
+
   local file=
   for file in "${watches[@]}"; do
     if [[ $file -nt $profile_rc ]]; then
@@ -370,7 +452,13 @@ use_flake() {
       _nix_direnv_warn_manual_reload "$profile_rc"
 
     else
-      _update_flake_profile "$layout_dir" "$profile" "$profile_rc" "$flake_uri" "$@"
+      local hash=$(_calculate_cache_hash watches "$flake_uri")
+      if [[ -n "${NIX_DIRENV_DISABLE_CACHE_RESTORE:-}" ]] || ! _restore_from_cache "$hash" "$layout_dir"; then
+        _update_flake_profile "$layout_dir" "$profile" "$profile_rc" "$flake_uri" "$@"
+        if [[ "${NIX_DIRENV_DID_FALLBACK:-0}" != "1" ]]; then
+          _store_into_cache "$hash" "$layout_dir"
+        fi
+      fi
     fi
   else
     if [[ -e ${profile_rc} ]]; then

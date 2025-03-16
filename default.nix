@@ -2,6 +2,9 @@
   resholve,
   lib,
   coreutils,
+  diffutils,
+  findutils,
+  gnutar,
   nix,
   writeText,
 }:
@@ -25,7 +28,7 @@ resholve.mkDerivation rec {
     default = {
       scripts = [ "share/${pname}/direnvrc" ];
       interpreter = "none";
-      inputs = [ coreutils ];
+      inputs = [ coreutils diffutils findutils gnutar ];
       fake = {
         builtin = [
           "PATH_add"
@@ -41,6 +44,8 @@ resholve.mkDerivation rec {
           "shasum"
         ];
         external = [
+          "detcache"
+          "diff"
           # We want to reference the ambient Nix when possible, and have custom logic
           # for the fallback
           "nix"
